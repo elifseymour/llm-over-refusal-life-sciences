@@ -1,0 +1,28 @@
+# Environment and secrets
+.env
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+
+# idea (from PyCharm)
+.idea/
+
+# planning (private: contains application-strategy notes)
+planning/
+
+# results (excluded until a real pilot run exists)
+results/
+
+# docs (report not written yet)
+docs/
+
+# rubrics (kept private pending review)
+rubrics/

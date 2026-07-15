@@ -1,0 +1,9 @@
+pandas
+numpy
+matplotlib
+scikit-learn
+jupyter
+python-dotenv
+anthropic
+openai
+google-generativeai
