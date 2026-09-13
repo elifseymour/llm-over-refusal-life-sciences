@@ -24,6 +24,7 @@ import pandas as pd
 REFUSAL = "refusal"
 USEFUL = "useful"
 NOT_USEFUL = "not_useful"
+PRIMARY_LABELS = [REFUSAL, USEFUL, NOT_USEFUL]
 
 
 def load_scored(path="results/scored_responses.csv"):
@@ -191,6 +192,11 @@ def judge_expert_agreement(judge_labels, expert_labels):
     """Cohen's kappa and percent agreement between judge and expert primary labels.
 
     Pass two aligned sequences of labels for the same responses. Returns a dict.
+
+    This is the low-level primitive: it assumes the two sequences are already
+    aligned and contain no blanks. To compare the judge's scored file against a
+    partially-filled expert sheet, use judge_expert_agreement_from_sheets, which
+    joins on (query_id, model_name) and drops unlabeled rows for you.
     """
     from sklearn.metrics import cohen_kappa_score
 
@@ -201,6 +207,88 @@ def judge_expert_agreement(judge_labels, expert_labels):
     kappa = cohen_kappa_score(expert_labels, judge_labels)
     agree = sum(a == b for a, b in zip(judge_labels, expert_labels)) / len(judge_labels)
     return {"cohen_kappa": kappa, "percent_agreement": agree, "n": len(judge_labels)}
+
+
+def _normalize_label(x):
+    """Lowercase/strip a label and fold spaces and hyphens to underscores.
+
+    So "Not Useful", "not-useful", and "not_useful" all compare equal, without
+    silently rewriting a genuinely different word.
+    """
+    return str(x).strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def align_judge_expert(scored, expert, id_cols=("query_id", "model_name")):
+    """Join the judge's scored data to the expert sheet, keeping only labeled rows.
+
+    - scored: judge output (has a 'label' column), e.g. results/scored_responses.csv.
+    - expert: the labeling sheet (has an 'expert_label' column), possibly with many
+      blank rows.
+
+    Rows the expert left blank are dropped, so you can hand-label any subset and
+    still get a valid comparison. Both label columns are normalized. Returns a
+    DataFrame with id_cols + ['expert_label', 'judge_label'], one row per labeled
+    response that also exists in the scored file. Raises if the expert used a label
+    outside {refusal, useful, not_useful} so typos surface instead of corrupting
+    the score.
+    """
+    id_cols = list(id_cols)
+    e = expert[id_cols + ["expert_label"]].copy()
+    e["expert_label"] = e["expert_label"].map(_normalize_label)
+    e = e[~e["expert_label"].isin(["", "nan", "none"])]
+    if e.empty:
+        raise ValueError(
+            "No expert-labeled rows found (expert_label is blank in every row). "
+            "Fill in some labels first."
+        )
+    bad = sorted(set(e["expert_label"]) - set(PRIMARY_LABELS))
+    if bad:
+        raise ValueError(
+            f"Unrecognized expert_label value(s): {bad}. "
+            f"Use one of {PRIMARY_LABELS} (blank to skip a row)."
+        )
+    j = scored[id_cols + ["label"]].copy()
+    j["label"] = j["label"].map(_normalize_label)
+    merged = e.merge(j, on=id_cols, how="inner").rename(columns={"label": "judge_label"})
+    dropped = len(e) - len(merged)
+    if dropped:
+        print(f"Warning: {dropped} labeled row(s) had no match in the scored file "
+              f"(check query_id/model_name) and were excluded.")
+    return merged
+
+
+def judge_expert_agreement_from_sheets(scored, expert, id_cols=("query_id", "model_name")):
+    """Blank-safe judge-vs-expert agreement on whatever subset the expert labeled.
+
+    Joins the judge's scored data to the expert sheet on id_cols, drops unlabeled
+    rows, and returns Cohen's kappa, percent agreement, n, and the confusion matrix
+    (rows = expert, cols = judge, over [refusal, useful, not_useful]). When only one
+    label class is present across both raters kappa is degenerate (nan); a 'note'
+    field flags that so you report percent_agreement and n instead.
+    """
+    from sklearn.metrics import cohen_kappa_score, confusion_matrix
+
+    merged = align_judge_expert(scored, expert, id_cols=id_cols)
+    expert_l = merged["expert_label"].tolist()
+    judge_l = merged["judge_label"].tolist()
+    n = len(merged)
+    kappa = cohen_kappa_score(expert_l, judge_l, labels=PRIMARY_LABELS)
+    agree = sum(a == b for a, b in zip(expert_l, judge_l)) / n
+    cm = confusion_matrix(expert_l, judge_l, labels=PRIMARY_LABELS)
+    result = {
+        "cohen_kappa": float(kappa) if kappa == kappa else float("nan"),  # nan-safe
+        "percent_agreement": agree,
+        "n": n,
+        "labels": list(PRIMARY_LABELS),
+        "confusion_matrix": cm.tolist(),  # rows = expert, cols = judge
+    }
+    if len(set(expert_l) | set(judge_l)) < 2:
+        result["note"] = (
+            "Only one label class is present across both raters, so Cohen's kappa is "
+            "degenerate (nan) — chance-correction has nothing to work with. Report "
+            "percent_agreement and n, and label some minority-class rows if you can."
+        )
+    return result
 
 
 # --- Simple plotting helpers (matplotlib) ---------------------------------

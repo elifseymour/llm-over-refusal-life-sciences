@@ -104,13 +104,16 @@ def _call_anthropic(version, query_text):
     from anthropic import Anthropic
 
     client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    # temperature is deprecated for the Claude 5 family, so it is not sent.
     msg = client.messages.create(
         model=version,
         max_tokens=MAX_TOKENS,
-        temperature=TEMPERATURE,
         messages=[{"role": "user", "content": query_text}],
     )
-    return "".join(block.text for block in msg.content if block.type == "text")
+    text = "".join(block.text for block in msg.content if block.type == "text")
+    # stop_reason is returned so a classifier refusal (stop_reason == "refusal",
+    # which yields no text blocks) is captured rather than saved as blank text.
+    return text, msg.stop_reason
 
 
 def _call_openai(version, query_text):
@@ -123,7 +126,7 @@ def _call_openai(version, query_text):
         max_tokens=MAX_TOKENS,
         messages=[{"role": "user", "content": query_text}],
     )
-    return resp.choices[0].message.content
+    return resp.choices[0].message.content, resp.choices[0].finish_reason
 
 
 def _call_google(version, query_text):
@@ -132,7 +135,10 @@ def _call_google(version, query_text):
     genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
     model = genai.GenerativeModel(version)
     resp = model.generate_content(query_text)
-    return resp.text
+    finish = None
+    if resp.candidates:
+        finish = getattr(resp.candidates[0], "finish_reason", None)
+    return resp.text, finish
 
 
 def _call_openrouter(version, query_text):
@@ -148,7 +154,7 @@ def _call_openrouter(version, query_text):
         max_tokens=MAX_TOKENS,
         messages=[{"role": "user", "content": query_text}],
     )
-    return resp.choices[0].message.content
+    return resp.choices[0].message.content, resp.choices[0].finish_reason
 
 
 _DISPATCH = {
@@ -159,8 +165,13 @@ _DISPATCH = {
 }
 
 
+# Stop/finish reasons that indicate the provider declined the request rather
+# than answering it. A refusal yields no usable text, so we record it explicitly.
+REFUSAL_STOP_REASONS = {"refusal", "content_filter"}
+
+
 def call_model(model_name, query_text, max_retries=3):
-    """Send one query to one model and return the response text."""
+    """Send one query to one model and return (response_text, stop_reason)."""
     spec = MODEL_REGISTRY[model_name]
     fn = _DISPATCH[spec["provider"]]
     last_err = None
@@ -178,14 +189,30 @@ def active_models():
     return [name for name, spec in MODEL_REGISTRY.items() if spec["active"]]
 
 
+def _existing_pairs(out_path):
+    """Return the set of (query_id, model_name) already present in out_path."""
+    if not os.path.exists(out_path):
+        return set(), None
+    prior = pd.read_csv(out_path)
+    if not {"query_id", "model_name"}.issubset(prior.columns):
+        return set(), prior
+    pairs = set(zip(prior["query_id"].astype(str), prior["model_name"].astype(str)))
+    return pairs, prior
+
+
 def run_all(models=None, queries_path="data/queries.csv", pilot_n=None,
             stratify=False, per_life_topic=5, life_topics=None, n_control=None,
-            out_path="results/model_responses.csv"):
+            out_path="results/model_responses.csv", skip_existing=False):
     """Run every query through every model and collect responses.
 
     If stratify is True, the pilot is a topic-balanced sample (per_life_topic from
     each included life topic + n_control controls); otherwise a uniform pilot_n
     random sample is used.
+
+    If skip_existing is True, any (query_id, model_name) already present in
+    out_path is skipped and the new rows are APPENDED to it (resume mode), so a
+    partial run can be extended to more queries without re-calling the API on
+    responses already collected. Otherwise out_path is overwritten.
     """
     models = models or active_models()
     if stratify:
@@ -195,11 +222,32 @@ def run_all(models=None, queries_path="data/queries.csv", pilot_n=None,
         )
     else:
         queries = load_queries(queries_path, pilot_n=pilot_n)
+
+    done_pairs, prior = (set(), None)
+    if skip_existing:
+        done_pairs, prior = _existing_pairs(out_path)
+
     rows = []
+    skipped = 0
     for model_name in models:
         version = MODEL_REGISTRY[model_name]["version"]
         for _, q in queries.iterrows():
-            response = call_model(model_name, q["query_text"])
+            if (str(q["query_id"]), str(model_name)) in done_pairs:
+                skipped += 1
+                print(f"{model_name} <- {q['query_id']}  [skip: already present]")
+                continue
+            response, stop_reason = call_model(model_name, q["query_text"])
+            # A classifier refusal (stop_reason == "refusal") or an otherwise empty
+            # response is recorded with an explicit marker so it is never confused
+            # with an errored/blank response when scoring or hand-labeling.
+            refused = stop_reason in REFUSAL_STOP_REASONS or not (response and response.strip())
+            if refused:
+                if stop_reason is None:
+                    stop_reason = "empty_response"
+                response = (
+                    "[REFUSAL — the model returned no content; "
+                    f"stop_reason={stop_reason}]"
+                )
             rows.append({
                 "query_id": q["query_id"],
                 "query_text": q["query_text"],
@@ -208,12 +256,22 @@ def run_all(models=None, queries_path="data/queries.csv", pilot_n=None,
                 "model_name": model_name,
                 "model_version": version,
                 "response_text": response,
+                "stop_reason": stop_reason,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
-            print(f"{model_name} <- {q['query_id']}")
-    responses = pd.DataFrame(rows)
-    responses.to_csv(out_path, index=False)
-    return responses
+            print(f"{model_name} <- {q['query_id']}"
+                  + (f"  [{stop_reason}]" if refused else ""))
+
+    new_rows = pd.DataFrame(rows)
+    if skip_existing and prior is not None:
+        combined = pd.concat([prior, new_rows], ignore_index=True)
+    else:
+        combined = new_rows
+    combined.to_csv(out_path, index=False)
+    if skip_existing:
+        print(f"\nAppended {len(new_rows)} new rows (skipped {skipped} already present); "
+              f"{out_path} now holds {len(combined)} rows.")
+    return new_rows
 
 
 def main():
@@ -233,15 +291,19 @@ def main():
     parser.add_argument("--n-control", type=int, default=None,
                         help="With --stratify: number of control queries (default: all).")
     parser.add_argument("--out", default="results/model_responses.csv")
+    parser.add_argument("--skip-existing", action="store_true",
+                        help="Resume mode: skip (query_id, model) pairs already in "
+                             "--out and append only the new rows (instead of overwriting).")
     args = parser.parse_args()
     life_topics = [t.strip() for t in args.life_topics.split(",")] if args.life_topics else None
     responses = run_all(
         queries_path=args.queries, pilot_n=args.pilot_n, stratify=args.stratify,
         per_life_topic=args.per_life_topic, life_topics=life_topics,
-        n_control=args.n_control, out_path=args.out,
+        n_control=args.n_control, out_path=args.out, skip_existing=args.skip_existing,
     )
-    print(f"\nCollected {len(responses)} responses from {sorted(responses['model_name'].unique())} "
-          f"-> {args.out}")
+    print(f"\nCollected {len(responses)} new responses"
+          + (f" from {sorted(responses['model_name'].unique())}" if len(responses) else "")
+          + f" -> {args.out}")
 
 
 if __name__ == "__main__":
