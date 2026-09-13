@@ -16,7 +16,8 @@ __pycache__/
 .idea/
 
 # planning (private: contains application-strategy notes)
-planning/
+planning/over_refusal_day_by_day_plan.md
+planning/over_refusal_proposal.md
 
 # results (excluded until a real pilot run exists)
 results/
@@ -24,5 +25,5 @@ results/
 # docs (report not written yet)
 docs/
 
-# rubrics (kept private pending review)
-rubrics/
+# rubrics 
+rubrics/query_design_guidelines.md
